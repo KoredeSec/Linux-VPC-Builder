@@ -9,9 +9,6 @@
 
 A production-ready CLI tool that recreates cloud VPC functionality entirely on Linux, demonstrating how container networking and cloud infrastructure work under the hood.
 
-![VPC Architecture](https://via.placeholder.com/800x400?text=VPC+Architecture+Diagram)
-*Replace with your architecture diagram*
-
 ---
 
 ## 📋 Table of Contents
