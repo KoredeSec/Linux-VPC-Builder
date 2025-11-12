@@ -1,0 +1,506 @@
+#!/usr/bin/env python3
+"""
+vpcctl - Virtual Private Cloud Management CLI
+Fixed version with proper routing
+"""
+
+import subprocess
+import json
+import sys
+import os
+import ipaddress
+from pathlib import Path
+from datetime import datetime
+
+# Configuration directory
+CONFIG_DIR = Path.home() / ".vpcctl"
+VPC_CONFIG_FILE = CONFIG_DIR / "vpcs.json"
+LOG_FILE = CONFIG_DIR / "vpcctl.log"
+
+def log(message, to_file=True):
+    """Log messages with timestamp"""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    log_message = f"[{timestamp}] {message}"
+    print(log_message)
+    
+    if to_file:
+        CONFIG_DIR.mkdir(exist_ok=True)
+        with open(LOG_FILE, 'a') as f:
+            f.write(log_message + "\n")
+
+def run_command(cmd, check=True, capture=True):
+    """Execute shell command and return output"""
+    log(f"Executing: {cmd}")
+    try:
+        if capture:
+            result = subprocess.run(cmd, shell=True, check=check, 
+                                  capture_output=True, text=True)
+            return result.stdout.strip()
+        else:
+            subprocess.run(cmd, shell=True, check=check)
+            return ""
+    except subprocess.CalledProcessError as e:
+        log(f"ERROR: Command failed: {e}")
+        if capture and e.stderr:
+            log(f"STDERR: {e.stderr}")
+        if check:
+            raise
+        return None
+
+def ensure_root():
+    """Ensure script is run as root"""
+    if os.geteuid() != 0:
+        log("ERROR: This script must be run as root (use sudo)")
+        sys.exit(1)
+
+def load_vpc_config():
+    """Load VPC configuration from file"""
+    CONFIG_DIR.mkdir(exist_ok=True)
+    if VPC_CONFIG_FILE.exists():
+        with open(VPC_CONFIG_FILE, 'r') as f:
+            return json.load(f)
+    return {}
+
+def save_vpc_config(config):
+    """Save VPC configuration to file"""
+    CONFIG_DIR.mkdir(exist_ok=True)
+    with open(VPC_CONFIG_FILE, 'w') as f:
+        json.dump(config, f, indent=2)
+    log(f"Configuration saved to {VPC_CONFIG_FILE}")
+
+def create_vpc(vpc_name, cidr_block, internet_interface="enp0s3"):
+    """Create a new VPC"""
+    ensure_root()
+    config = load_vpc_config()
+    
+    if vpc_name in config:
+        log(f"ERROR: VPC '{vpc_name}' already exists")
+        return False
+    
+    # Validate CIDR block
+    try:
+        network = ipaddress.IPv4Network(cidr_block)
+    except ValueError as e:
+        log(f"ERROR: Invalid CIDR block: {e}")
+        return False
+    
+    log(f"Creating VPC '{vpc_name}' with CIDR {cidr_block}")
+    
+    # Create bridge for VPC
+    bridge_name = f"br-{vpc_name[:8]}"
+    run_command(f"ip link add {bridge_name} type bridge")
+    run_command(f"ip link set {bridge_name} up")
+    
+    # Assign gateway IP to bridge (first usable IP in range)
+    gateway_ip = str(list(network.hosts())[0])
+    run_command(f"ip addr add {gateway_ip}/{network.prefixlen} dev {bridge_name}")
+    
+    # Enable IP forwarding
+    run_command("sysctl -w net.ipv4.ip_forward=1")
+    
+    # Setup NAT for internet access
+    run_command(f"iptables -t nat -A POSTROUTING -s {cidr_block} -o {internet_interface} -j MASQUERADE")
+    run_command(f"iptables -A FORWARD -i {bridge_name} -j ACCEPT")
+    run_command(f"iptables -A FORWARD -o {bridge_name} -j ACCEPT")
+    
+    # Add isolation rules: Block traffic between different VPC CIDRs
+    # This needs to be done for each existing VPC
+    for existing_vpc_name, existing_vpc in config.items():
+        existing_cidr = existing_vpc['cidr_block']
+        # Block new VPC -> existing VPC
+        run_command(f"iptables -I FORWARD -s {cidr_block} -d {existing_cidr} -j DROP")
+        # Block existing VPC -> new VPC
+        run_command(f"iptables -I FORWARD -s {existing_cidr} -d {cidr_block} -j DROP")
+    
+    # Save VPC configuration
+    config[vpc_name] = {
+        "cidr_block": cidr_block,
+        "bridge": bridge_name,
+        "gateway_ip": gateway_ip,
+        "internet_interface": internet_interface,
+        "subnets": {},
+        "peerings": [],
+        "isolation_rules": []  # Track isolation rules for cleanup
+    }
+    
+    # Store isolation rules for cleanup
+    for existing_vpc_name in config.keys():
+        if existing_vpc_name != vpc_name:
+            config[vpc_name]["isolation_rules"].append(existing_vpc_name)
+            if "isolation_rules" not in config[existing_vpc_name]:
+                config[existing_vpc_name]["isolation_rules"] = []
+            config[existing_vpc_name]["isolation_rules"].append(vpc_name)
+    
+    save_vpc_config(config)
+    
+    log(f"✓ VPC '{vpc_name}' created successfully")
+    log(f"  Bridge: {bridge_name}")
+    log(f"  Gateway: {gateway_ip}")
+    log(f"  CIDR: {cidr_block}")
+    return True
+
+def add_subnet(vpc_name, subnet_name, subnet_cidr, subnet_type="private"):
+    """Add a subnet to a VPC"""
+    ensure_root()
+    config = load_vpc_config()
+    
+    if vpc_name not in config:
+        log(f"ERROR: VPC '{vpc_name}' does not exist")
+        return False
+    
+    vpc = config[vpc_name]
+    
+    if subnet_name in vpc["subnets"]:
+        log(f"ERROR: Subnet '{subnet_name}' already exists in VPC '{vpc_name}'")
+        return False
+    
+    # Validate subnet CIDR is within VPC CIDR
+    try:
+        vpc_network = ipaddress.IPv4Network(vpc["cidr_block"])
+        subnet_network = ipaddress.IPv4Network(subnet_cidr)
+        if not subnet_network.subnet_of(vpc_network):
+            log(f"ERROR: Subnet {subnet_cidr} is not within VPC CIDR {vpc['cidr_block']}")
+            return False
+    except ValueError as e:
+        log(f"ERROR: Invalid CIDR: {e}")
+        return False
+    
+    log(f"Adding subnet '{subnet_name}' ({subnet_type}) to VPC '{vpc_name}'")
+    
+    # Create network namespace
+    ns_name = f"ns-{vpc_name[:6]}-{subnet_name[:6]}"
+    run_command(f"ip netns add {ns_name}")
+    
+    # Create veth pair
+    veth_host = f"veth-{subnet_name[:8]}"
+    veth_ns = f"veth-ns-{subnet_name[:6]}"
+    run_command(f"ip link add {veth_host} type veth peer name {veth_ns}")
+    
+    # Attach host side to bridge
+    run_command(f"ip link set {veth_host} master {vpc['bridge']}")
+    run_command(f"ip link set {veth_host} up")
+    
+    # Move namespace side to namespace
+    run_command(f"ip link set {veth_ns} netns {ns_name}")
+    
+    # Configure namespace interface
+    subnet_ip = str(list(subnet_network.hosts())[0])
+    run_command(f"ip netns exec {ns_name} ip link set lo up")
+    run_command(f"ip netns exec {ns_name} ip link set {veth_ns} up")
+    run_command(f"ip netns exec {ns_name} ip addr add {subnet_ip}/{subnet_network.prefixlen} dev {veth_ns}")
+    
+    # FIX: Add route to VPC network first, then default route
+    # This ensures the gateway is reachable
+    vpc_cidr = vpc['cidr_block']
+    run_command(f"ip netns exec {ns_name} ip route add {vpc_cidr} dev {veth_ns}")
+    run_command(f"ip netns exec {ns_name} ip route add default via {vpc['gateway_ip']} dev {veth_ns}")
+    
+    # Save subnet configuration
+    vpc["subnets"][subnet_name] = {
+        "cidr": subnet_cidr,
+        "type": subnet_type,
+        "namespace": ns_name,
+        "veth_host": veth_host,
+        "veth_ns": veth_ns,
+        "ip": subnet_ip
+    }
+    save_vpc_config(config)
+    
+    log(f"✓ Subnet '{subnet_name}' added successfully")
+    log(f"  Namespace: {ns_name}")
+    log(f"  IP: {subnet_ip}")
+    log(f"  Type: {subnet_type}")
+    return True
+
+def apply_firewall_rules(vpc_name, subnet_name, rules_file):
+    """Apply firewall rules to a subnet"""
+    ensure_root()
+    config = load_vpc_config()
+    
+    if vpc_name not in config:
+        log(f"ERROR: VPC '{vpc_name}' does not exist")
+        return False
+    
+    vpc = config[vpc_name]
+    
+    if subnet_name not in vpc["subnets"]:
+        log(f"ERROR: Subnet '{subnet_name}' does not exist")
+        return False
+    
+    # Load rules from file
+    try:
+        with open(rules_file, 'r') as f:
+            rules = json.load(f)
+    except Exception as e:
+        log(f"ERROR: Failed to load rules file: {e}")
+        return False
+    
+    subnet = vpc["subnets"][subnet_name]
+    ns_name = subnet["namespace"]
+    
+    log(f"Applying firewall rules to subnet '{subnet_name}'")
+    
+    # Apply ingress rules
+    for rule in rules.get("ingress", []):
+        port = rule.get("port")
+        protocol = rule.get("protocol", "tcp")
+        action = rule.get("action", "allow").upper()
+        
+        if action == "DENY":
+            cmd = f"ip netns exec {ns_name} iptables -A INPUT -p {protocol} --dport {port} -j DROP"
+            run_command(cmd)
+            log(f"  ✓ Denying {protocol}/{port}")
+        else:
+            log(f"  ✓ Allowing {protocol}/{port} (default)")
+    
+    log(f"✓ Firewall rules applied successfully")
+    return True
+
+def peer_vpcs(vpc1_name, vpc2_name):
+    """Create peering between two VPCs"""
+    ensure_root()
+    config = load_vpc_config()
+    
+    if vpc1_name not in config or vpc2_name not in config:
+        log(f"ERROR: One or both VPCs do not exist")
+        return False
+    
+    # Check if already peered
+    vpc1 = config[vpc1_name]
+    vpc2 = config[vpc2_name]
+    
+    if vpc2_name in vpc1.get("peerings", []):
+        log(f"VPCs '{vpc1_name}' and '{vpc2_name}' are already peered")
+        return True
+    
+    log(f"Creating peering between '{vpc1_name}' and '{vpc2_name}'")
+    
+    # Remove isolation rules between these VPCs
+    vpc1_cidr = vpc1['cidr_block']
+    vpc2_cidr = vpc2['cidr_block']
+    
+    log(f"  Removing isolation rules between VPCs")
+    run_command(f"iptables -D FORWARD -s {vpc1_cidr} -d {vpc2_cidr} -j DROP", check=False)
+    run_command(f"iptables -D FORWARD -s {vpc2_cidr} -d {vpc1_cidr} -j DROP", check=False)
+    
+    # Create veth pair between bridges
+    peer_veth1 = f"peer-{vpc1_name[:4]}-{vpc2_name[:4]}"
+    peer_veth2 = f"peer-{vpc2_name[:4]}-{vpc1_name[:4]}"
+    
+    # Delete if exists (cleanup from previous failed runs)
+    run_command(f"ip link del {peer_veth1}", check=False)
+    run_command(f"ip link del {peer_veth2}", check=False)
+    
+    # Create new veth pair
+    run_command(f"ip link add {peer_veth1} type veth peer name {peer_veth2}")
+    run_command(f"ip link set {peer_veth1} master {vpc1['bridge']}")
+    run_command(f"ip link set {peer_veth2} master {vpc2['bridge']}")
+    run_command(f"ip link set {peer_veth1} up")
+    run_command(f"ip link set {peer_veth2} up")
+    
+    # Add routes between VPCs on the HOST routing table
+    # This allows packets to route between the bridges
+    run_command(f"ip route add {vpc2['cidr_block']} dev {vpc1['bridge']}", check=False)
+    run_command(f"ip route add {vpc1['cidr_block']} dev {vpc2['bridge']}", check=False)
+    
+    # Save peering configuration
+    if "peerings" not in vpc1:
+        vpc1["peerings"] = []
+    if "peerings" not in vpc2:
+        vpc2["peerings"] = []
+    
+    vpc1["peerings"].append(vpc2_name)
+    vpc2["peerings"].append(vpc1_name)
+    
+    # Store peering veth info for cleanup
+    if "peering_veths" not in vpc1:
+        vpc1["peering_veths"] = {}
+    if "peering_veths" not in vpc2:
+        vpc2["peering_veths"] = {}
+    
+    vpc1["peering_veths"][vpc2_name] = peer_veth1
+    vpc2["peering_veths"][vpc1_name] = peer_veth2
+    
+    save_vpc_config(config)
+    
+    log(f"✓ Peering created successfully")
+    return True
+
+def list_vpcs():
+    """List all VPCs"""
+    config = load_vpc_config()
+    
+    if not config:
+        print("\n❌ No VPCs found")
+        return
+    
+    print("\n" + "="*60)
+    print("📊 VPC INVENTORY")
+    print("="*60)
+    
+    for vpc_name, vpc in config.items():
+        print(f"\n🌐 VPC: {vpc_name}")
+        print(f"   CIDR: {vpc['cidr_block']}")
+        print(f"   Bridge: {vpc['bridge']}")
+        print(f"   Gateway: {vpc['gateway_ip']}")
+        print(f"   Internet Interface: {vpc['internet_interface']}")
+        
+        if vpc['subnets']:
+            print(f"\n   📁 Subnets ({len(vpc['subnets'])}):")
+            for subnet_name, subnet in vpc['subnets'].items():
+                print(f"      • {subnet_name} ({subnet['type']})")
+                print(f"        CIDR: {subnet['cidr']}")
+                print(f"        IP: {subnet['ip']}")
+                print(f"        Namespace: {subnet['namespace']}")
+        
+        if vpc['peerings']:
+            print(f"\n   🔗 Peerings: {', '.join(vpc['peerings'])}")
+    
+    print("\n" + "="*60)
+
+def delete_vpc(vpc_name):
+    """Delete a VPC and all its resources"""
+    ensure_root()
+    config = load_vpc_config()
+    
+    if vpc_name not in config:
+        log(f"ERROR: VPC '{vpc_name}' does not exist")
+        return False
+    
+    log(f"Deleting VPC '{vpc_name}'")
+    
+    vpc = config[vpc_name]
+    
+    # Delete subnets
+    for subnet_name, subnet in vpc["subnets"].items():
+        log(f"  Deleting subnet '{subnet_name}'")
+        run_command(f"ip netns del {subnet['namespace']}", check=False)
+        run_command(f"ip link del {subnet['veth_host']}", check=False)
+    
+    # Delete peering connections
+    for peer_vpc in vpc["peerings"]:
+        log(f"  Removing peering with '{peer_vpc}'")
+        peer_veth1 = f"peer-{vpc_name[:4]}-{peer_vpc[:4]}"
+        run_command(f"ip link del {peer_veth1}", check=False)
+        
+        # Remove routes
+        if peer_vpc in config:
+            peer_cidr = config[peer_vpc]['cidr_block']
+            run_command(f"ip route del {peer_cidr} dev {vpc['bridge']}", check=False)
+        
+        # Remove from peer's peering list
+        if peer_vpc in config:
+            config[peer_vpc]["peerings"] = [p for p in config[peer_vpc]["peerings"] if p != vpc_name]
+    
+    # Remove NAT rules
+    run_command(f"iptables -t nat -D POSTROUTING -s {vpc['cidr_block']} -o {vpc['internet_interface']} -j MASQUERADE", check=False)
+    run_command(f"iptables -D FORWARD -i {vpc['bridge']} -j ACCEPT", check=False)
+    run_command(f"iptables -D FORWARD -o {vpc['bridge']} -j ACCEPT", check=False)
+    
+    # Delete bridge
+    run_command(f"ip link set {vpc['bridge']} down", check=False)
+    run_command(f"ip link del {vpc['bridge']}", check=False)
+    
+    # Remove from configuration
+    del config[vpc_name]
+    save_vpc_config(config)
+    
+    log(f"✓ VPC '{vpc_name}' deleted successfully")
+    return True
+
+def show_logs():
+    """Display recent logs"""
+    if LOG_FILE.exists():
+        print("\n📋 Recent Logs (last 50 lines):")
+        print("="*60)
+        with open(LOG_FILE, 'r') as f:
+            lines = f.readlines()
+            for line in lines[-50:]:
+                print(line.rstrip())
+    else:
+        print("No logs found")
+
+def main():
+    """Main CLI entry point"""
+    if len(sys.argv) < 2:
+        print("""
+╔══════════════════════════════════════════════════════════════╗
+║                   VPCCTL - VPC Management                    ║
+╚══════════════════════════════════════════════════════════════╝
+
+Usage: sudo ./vpcctl <command> [options]
+
+Commands:
+  create-vpc <name> <cidr> [interface]     Create a new VPC
+  add-subnet <vpc> <name> <cidr> <type>    Add subnet (type: public/private)
+  apply-rules <vpc> <subnet> <rules.json>  Apply firewall rules
+  peer-vpcs <vpc1> <vpc2>                  Create VPC peering
+  list                                     List all VPCs
+  delete-vpc <name>                        Delete a VPC
+  logs                                     Show recent logs
+  
+Examples:
+  sudo ./vpcctl create-vpc prod 10.0.0.0/16 enp0s3
+  sudo ./vpcctl add-subnet prod web 10.0.1.0/24 public
+  sudo ./vpcctl add-subnet prod db 10.0.2.0/24 private
+  sudo ./vpcctl apply-rules prod web rules.json
+  sudo ./vpcctl peer-vpcs prod staging
+  sudo ./vpcctl list
+  sudo ./vpcctl delete-vpc prod
+  sudo ./vpcctl logs
+
+Notes:
+  - All commands require sudo/root privileges
+  - Default interface is 'enp0s3' (common in VMs)
+  - Logs are saved to ~/.vpcctl/vpcctl.log
+  - Config is saved to ~/.vpcctl/vpcs.json
+        """)
+        sys.exit(1)
+    
+    command = sys.argv[1]
+    
+    if command == "create-vpc":
+        if len(sys.argv) < 4:
+            log("ERROR: Usage: vpcctl create-vpc <name> <cidr> [interface]")
+            sys.exit(1)
+        vpc_name = sys.argv[2]
+        cidr = sys.argv[3]
+        interface = sys.argv[4] if len(sys.argv) > 4 else "enp0s3"
+        create_vpc(vpc_name, cidr, interface)
+    
+    elif command == "add-subnet":
+        if len(sys.argv) < 6:
+            log("ERROR: Usage: vpcctl add-subnet <vpc> <name> <cidr> <type>")
+            sys.exit(1)
+        add_subnet(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5])
+    
+    elif command == "apply-rules":
+        if len(sys.argv) < 5:
+            log("ERROR: Usage: vpcctl apply-rules <vpc> <subnet> <rules.json>")
+            sys.exit(1)
+        apply_firewall_rules(sys.argv[2], sys.argv[3], sys.argv[4])
+    
+    elif command == "peer-vpcs":
+        if len(sys.argv) < 4:
+            log("ERROR: Usage: vpcctl peer-vpcs <vpc1> <vpc2>")
+            sys.exit(1)
+        peer_vpcs(sys.argv[2], sys.argv[3])
+    
+    elif command == "list":
+        list_vpcs()
+    
+    elif command == "delete-vpc":
+        if len(sys.argv) < 3:
+            log("ERROR: Usage: vpcctl delete-vpc <name>")
+            sys.exit(1)
+        delete_vpc(sys.argv[2])
+    
+    elif command == "logs":
+        show_logs()
+    
+    else:
+        log(f"ERROR: Unknown command: {command}")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()

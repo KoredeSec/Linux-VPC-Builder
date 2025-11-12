@@ -1,0 +1,8 @@
+{
+  "subnet": "10.0.2.0/24",
+  "ingress": [
+    {"port": 3306, "protocol": "tcp", "action": "allow"},
+    {"port": 5432, "protocol": "tcp", "action": "allow"},
+    {"port": 27017, "protocol": "tcp", "action": "allow"}
+  ]
+}
