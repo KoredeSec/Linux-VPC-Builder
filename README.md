@@ -130,18 +130,60 @@ Host System (Ubuntu 24.04)
 
 ### Prerequisites
 
-- Ubuntu 22.04+ (or similar Linux distribution)
-- Root/sudo access
-- 2GB+ RAM, 2+ CPU cores
-- Basic networking knowledge
+**Recommended: Use a Virtual Machine (VM)**
 
-### 30-Second Demo
+This project modifies system networking. Using a VM is **strongly recommended** for:
+- ✅ **Safety** - Won't affect your host system
+- ✅ **Easy recovery** - VM snapshots let you rollback
+- ✅ **Clean testing** - Isolated environment
+
+**Requirements:**
+- Ubuntu 22.04 Server (in VirtualBox/VMware)
+- 4GB RAM, 2 CPU cores, 20GB disk
+- SSH enabled for remote access
+- Root/sudo access
+
+### VM Setup (Recommended)
 
 ```bash
-# Clone repository
-git clone https://github.com/yourusername/linux-vpc-builder.git
-cd linux-vpc-builder
+# On your host machine:
+# 1. Install VirtualBox
+sudo apt install virtualbox
 
+# 2. Create VM:
+#    - Name: vpc-lab
+#    - Type: Linux - Ubuntu (64-bit)
+#    - RAM: 4096 MB
+#    - Disk: 20 GB VDI
+#    - Network: NAT
+
+# 3. Install Ubuntu 22.04 Server
+#    - Enable OpenSSH during installation
+#    - Username: tory-devops (or your choice)
+
+# 4. Setup port forwarding for SSH
+VBoxManage modifyvm "vpc-lab" --natpf1 "ssh,tcp,,2222,,22"
+
+# 5. SSH into VM from host
+ssh -p 2222 tory-devops@localhost
+```
+
+### Transfer Project Files to VM
+
+```bash
+# On your host machine, copy files to VM:
+scp -P 2222 -r ./linux-vpc-builder/* tory-devops@localhost:~/vpc-project/
+
+# SSH into VM
+ssh -p 2222 tory-devops@localhost
+
+# Navigate to project
+cd ~/vpc-project
+```
+
+### 30-Second Demo (Inside VM)
+
+```bash
 # Setup dependencies
 sudo ./setup.sh
 
